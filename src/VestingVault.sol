@@ -11,7 +11,7 @@ import { FixedPointMathLib } from "solady-0.1.26/utils/FixedPointMathLib.sol";
 
 import { IVestingVault } from "./interfaces/IVestingVault.sol";
 
-contract VestingVault is IVestingVault, Ownable2Step, ReentrancyGuardTransient {
+contract VestingVault is IVestingVault, Ownable2Step {
     using SafeTransferLib for address;
 
     /* -------------------------------------------------------------------------- */
