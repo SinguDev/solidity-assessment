@@ -1,89 +1,158 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
+import { ReentrancyGuardTransient } from
+    "@openzeppelin-contracts-5.4.0/utils/ReentrancyGuardTransient.sol";
+import { Ownable2Step } from "@openzeppelin-contracts-5.4.0/access/Ownable2Step.sol";
+import { Ownable } from "@openzeppelin-contracts-5.4.0/access/Ownable.sol";
+import { IERC20 } from "@openzeppelin-contracts-5.4.0/token/ERC20/IERC20.sol";
+import { SafeTransferLib } from "solady-0.1.26/utils/SafeTransferLib.sol";
+import { FixedPointMathLib } from "solady-0.1.26/utils/FixedPointMathLib.sol";
 
-interface IERC20Mintable {
+import { IVestingVault } from "./interfaces/IVestingVault.sol";
 
-    function transfer(address to, uint256 amt) external returns (bool);
+contract VestingVault is IVestingVault, Ownable2Step, ReentrancyGuardTransient {
+    using SafeTransferLib for address;
 
-}
+    /* -------------------------------------------------------------------------- */
+    /*                                  CONSTANTS                                 */
+    /* -------------------------------------------------------------------------- */
 
-
-contract VestingVault {
-
-    error AlreadyEntrered();
-    error NotOwner();
-
+    /// @inheritdoc IVestingVault
     uint256 public constant MIN_CLAIM_DURATION = 1 days;
-    address public immutable OWNER;  
-    uint8 private entered; 
 
-    IERC20Mintable public immutable TOKEN;
+    /// @inheritdoc IVestingVault
+    uint256 public constant EXTRA_CLAIM_DURATION = 1 days;
 
-    struct Grant {
-        uint128 total;      // total tokens granted
-        uint128 claimed;    // tokens already claimed
-        uint64  start;      // vesting start timestamp
-        uint64  cliff;      // cliff seconds after start
-        uint64  duration;   // vesting duration in seconds
+    /* -------------------------------------------------------------------------- */
+    /*                                  VARIABLES                                 */
+    /* -------------------------------------------------------------------------- */
+
+    /// @dev The ERC20 token used for the vesting or grant process.
+    IERC20 internal immutable _token;
+
+    /// @dev Mapping from beneficiary addresses to their respective grant details.
+    mapping(address => Grant) internal _grants;
+
+    /* -------------------------------------------------------------------------- */
+    /*                                 CONSTRUCTOR                                */
+    /* -------------------------------------------------------------------------- */
+
+    /// @notice Initializes the contract with the specified token and owner
+    /// @param token The ERC20 token that is mintable and used in the contract
+    /// @param owner The address of the owner who will have administrative privileges
+    constructor(IERC20 token, address owner) Ownable(owner) {
+        _token = token;
     }
 
+    /* -------------------------------------------------------------------------- */
+    /*                              PUBLIC / EXTERNAL                             */
+    /* -------------------------------------------------------------------------- */
 
-    mapping(address => Grant) public grants;
+    /// @inheritdoc IVestingVault
+    function claim() external {
+        Grant memory grant = _grants[msg.sender];
 
-    
+        require(grant.total > 0, NotGranted());
+        require(block.timestamp >= grant.start + grant.cliff, CliffNotReached());
 
-    modifier onlyOwner() {
-        require(msg.sender == OWNER, NotOwner());
-        _;
+        uint128 claimableAmount = vestedOf(msg.sender);
+        require(claimableAmount > 0, NoClaim());
+
+        _grants[msg.sender].claimed += claimableAmount;
+        address(_token).safeTransfer(msg.sender, claimableAmount);
+
+        emit Claimed(msg.sender, claimableAmount);
     }
 
-    modifier NonReentrant() {
-        require(entered == 0, AlreadyEntrered());
-        entered = 1;
-        _;
-        entered = 0;
+    /// @inheritdoc IVestingVault
+    function vestedOf(address user) public view returns (uint128) {
+        Grant memory grant = _grants[user];
+
+        // If no grant or cliff not reached, nothing is vested
+        if (grant.total == 0 || block.timestamp < grant.start + grant.cliff) {
+            return 0;
+        }
+
+        // If the vesting duration has fully elapsed, all tokens are vested
+        if (block.timestamp >= grant.start + grant.duration) {
+            return grant.total - grant.claimed;
+        }
+
+        uint128 vested = uint128(
+            FixedPointMathLib.fullMulDiv(
+                grant.total,
+                block.timestamp - (grant.start + grant.cliff),
+                grant.duration - grant.cliff
+            )
+        );
+
+        return vested - grant.claimed;
     }
 
-
-    constructor(IERC20Mintable _token, address owner) {
-        OWNER = owner;
-        TOKEN = _token;
+    /// @inheritdoc IVestingVault
+    function getToken() external view returns (IERC20) {
+        return _token;
     }
 
+    /// @inheritdoc IVestingVault
+    function getGrant(address user) external view returns (Grant memory) {
+        return _grants[user];
+    }
 
+    /* -------------------------------------------------------------------------- */
+    /*                                    ADMIN                                   */
+    /* -------------------------------------------------------------------------- */
+
+    /// @inheritdoc IVestingVault
     function addGrant(
         address beneficiary,
         uint128 amount,
-        uint64  cliffSeconds,
-        uint64  durationSeconds
+        uint64 cliffSeconds,
+        uint64 durationSeconds
     ) external onlyOwner {
-        require(beneficiary != address(0), "already granted");
-        require(amount > 0, "already granted");
-        require(cliffSeconds + MIN_CLAIM_DURATION <= durationSeconds, "already granted");
+        require(beneficiary != address(0), InvalidBeneficiary());
+        require(amount > 0, InvalidAmount());
+        require(cliffSeconds + MIN_CLAIM_DURATION <= durationSeconds, InvalidDuration());
+        require(_grants[beneficiary].total == 0, AlreadyGranted());
 
-        grants[beneficiary] = Grant({
+        _grants[beneficiary] = Grant({
             total: amount,
             claimed: 0,
             start: uint64(block.timestamp),
             cliff: cliffSeconds,
             duration: durationSeconds
-        }); 
+        });
 
+        // Transfer the tokens from the owner to the contract
+        address(_token).safeTransferFrom(msg.sender, address(this), amount);
+
+        emit GrantAdded(beneficiary, amount, cliffSeconds, durationSeconds);
     }
 
+    /// @inheritdoc IVestingVault
+    function removeGrant(address beneficiary) external onlyOwner {
+        require(beneficiary != address(0), InvalidBeneficiary());
 
-    function claim() external  NonReentrant{
-        Grant storage grant = grants[msg.sender];
-        require(grant.total > 0, "no grant");
-        require(block.timestamp >= grant.start + grant.cliff, "cliff not reached");
+        Grant memory grant = _grants[beneficiary];
 
-        grant.claimed = grant.total;
-        TOKEN.mint(msg.sender, grants[msg.sender].total - grant.claimed);
-    
-    }                
+        require(grant.total > 0, NotGranted());
+        require(
+            block.timestamp >= grant.start + grant.duration + EXTRA_CLAIM_DURATION,
+            VestingNotEnded()
+        );
 
-    function vestedOf(address user) external view returns (uint256){
-        return grants[user].total;
+        // Remove the grant before transferring tokens to prevent reentrancy issues
+        delete _grants[beneficiary];
+
+        uint128 unclaimed;
+
+        // If there are unclaimed tokens, transfer them back to the owner
+        if (grant.total > grant.claimed) {
+            unclaimed = grant.total - grant.claimed;
+            address(_token).safeTransfer(msg.sender, unclaimed);
+        }
+
+        emit GrantRemoved(beneficiary, unclaimed);
     }
 }
